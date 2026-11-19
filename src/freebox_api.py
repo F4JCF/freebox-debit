@@ -11,7 +11,7 @@ import urllib.request
 
 APP_ID = "fr.f4jcf.freeboxdebit"
 APP_NAME = "Freebox Debit"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 
 class FreeboxError(Exception):
@@ -132,17 +132,30 @@ BANDS = {"2d4g": "Wi-Fi 2,4 GHz", "5g": "Wi-Fi 5 GHz", "6g": "Wi-Fi 6 GHz", "60g
 
 def _host_ip(host):
     best = ""
-    for c in host.get("l3connectivities") or []:
+    for c in _as_list(host.get("l3connectivities")):
         if c.get("af") == "ipv4" and c.get("addr"):
             if c.get("active") or not best:
                 best = c["addr"]
     return best
 
 
+def _as_list(v):
+    """L'API renvoie parfois un objet seul au lieu d'une liste."""
+    if isinstance(v, dict):
+        return [v]
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, dict)]
+    return []
+
+
+def _d(v):
+    return v if isinstance(v, dict) else {}
+
+
 def _host_mac(host):
-    for l2 in host.get("l2ident") or []:
+    for l2 in _as_list(host.get("l2ident")):
         if l2.get("id"):
-            return l2["id"].upper()
+            return str(l2["id"]).upper()
     hid = host.get("id", "")
     return hid.split("-", 1)[-1].upper() if hid else ""
 
@@ -161,7 +174,7 @@ def collect(client):
     warnings = []
     snap = {"time": time.time(), "devices": [], "warnings": warnings}
 
-    conn = client.call("connection/")
+    conn = _d(client.call("connection/"))
     snap["wan"] = {
         "down": _num(conn.get("rate_down")), "up": _num(conn.get("rate_up")),
         "bw_down": _num(conn.get("bandwidth_down")), "bw_up": _num(conn.get("bandwidth_up")),
@@ -170,7 +183,7 @@ def collect(client):
 
     hosts = {}
     try:
-        for h in client.call("lan/browser/pub/") or []:
+        for h in _as_list(client.call("lan/browser/pub/")):
             mac = _host_mac(h)
             if mac:
                 hosts[mac] = {
@@ -178,7 +191,7 @@ def collect(client):
                     "ip": _host_ip(h), "vendor": h.get("vendor_name", ""),
                     "type": h.get("host_type", ""), "active": h.get("active", False),
                 }
-    except FreeboxError as e:
+    except Exception as e:
         warnings.append(f"Liste des appareils indisponible : {e}")
 
     def describe(mac, fallback=""):
@@ -187,17 +200,17 @@ def collect(client):
 
     # Wi-Fi : débit par appareil
     try:
-        for ap in client.call("wifi/ap/") or []:
-            band = (ap.get("config") or {}).get("band", "")
+        for ap in _as_list(client.call("wifi/ap/")):
+            band = _d(ap.get("config")).get("band", "")
             label = BANDS.get(band, "Wi-Fi")
             try:
-                stations = client.call(f"wifi/ap/{ap['id']}/stations/") or []
+                stations = _as_list(client.call(f"wifi/ap/{ap.get('id')}/stations/"))
             except FreeboxError:
                 stations = []
             for st in stations:
                 mac = (st.get("mac") or "").upper()
-                name, ip, vendor = describe(mac, st.get("hostname") or (st.get("host") or {}).get("primary_name"))
-                if not ip and st.get("host"):
+                name, ip, vendor = describe(mac, st.get("hostname") or _d(st.get("host")).get("primary_name"))
+                if not ip and _d(st.get("host")):
                     ip = _host_ip(st["host"])
                 snap["devices"].append({
                     "key": "wifi:" + mac, "name": name, "ip": ip, "mac": mac, "vendor": vendor,
@@ -205,25 +218,26 @@ def collect(client):
                     "down": _num(st.get("tx_rate")), "up": _num(st.get("rx_rate")),
                     "signal": st.get("signal"), "exact": True,
                 })
-    except FreeboxError as e:
+    except Exception as e:
         warnings.append(f"Wi-Fi indisponible : {e}")
 
     # Ethernet : débit par port du switch (pas par appareil)
     try:
-        for port in client.call("switch/status/") or []:
+        for port in _as_list(client.call("switch/status/")):
             if port.get("link") != "up":
                 continue
             pid = port.get("id")
             try:
-                st = client.call(f"switch/port/{pid}/stats/") or {}
+                st = _d(client.call(f"switch/port/{pid}/stats/"))
             except FreeboxError:
                 st = {}
-            macs = [(m.get("mac") or "").upper() for m in port.get("mac_list") or []]
+            ml = _as_list(port.get("mac_list"))
+            macs = [str(m.get("mac") or "").upper() for m in ml]
             # rx = reçu par la box (envoyé par l'appareil), tx = envoyé vers l'appareil
             down, up = _num(st.get("tx_bytes_rate")), _num(st.get("rx_bytes_rate"))
             label = f"Ethernet port {pid}"
             if len(macs) == 1:
-                fb = (port.get("mac_list")[0].get("hostname") or port.get("mac_list")[0].get("name"))
+                fb = ml[0].get("hostname") or ml[0].get("name")
                 name, ip, vendor = describe(macs[0], fb)
                 snap["devices"].append({
                     "key": f"eth:{pid}", "name": name, "ip": ip, "mac": macs[0], "vendor": vendor,
@@ -238,7 +252,7 @@ def collect(client):
                     "vendor": ", ".join(names), "link": label, "down": down, "up": up,
                     "exact": False,
                 })
-    except FreeboxError as e:
+    except Exception as e:
         warnings.append(f"Ports Ethernet indisponibles : {e}")
 
     return snap
